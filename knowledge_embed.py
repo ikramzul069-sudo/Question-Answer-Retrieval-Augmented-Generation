@@ -1,83 +1,81 @@
+"""
+knowledge_embed.py
+
+This script reads a dataset from a TSV file, cleans it, processes it into a combined text format, 
+and ingests the text embeddings into a TiDB Vector Store using LangChain and HuggingFace.
+"""
+
 import os
-import json
 import pandas as pd
-import mysql.connector
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
-# Load environment variables securely
+# LangChain Libraries
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import TiDBVectorStore
+
+# Load environment variables securely from the .env file
 load_dotenv()
 
-# 1. Initialize the Embedder
+# ==========================================
+# 1. Initialize the Embedder via LangChain
+# ==========================================
 print("Loading Embedding Model...")
-embedder = SentenceTransformer('BAAI/bge-m3')
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
 
-# 2. Securely connect to TiDB Cloud 
-print("Connecting to TiDB Cloud...")
-#You can generate this connector via TiDB
-db = mysql.connector.connect(
-    host=os.getenv("TIDB_HOST"),
-    port=os.getenv("TIDB_PORT"),
-    user=os.getenv("TIDB_USER"),
-    password=os.getenv("TIDB_PASSWORD"),
-    database=os.getenv("TIDB_DATABASE"),
-    ssl_ca="<CA_PATH>", # Update this if a specific CA certificate is required
-    ssl_verify_cert=False,
-    ssl_verify_identity=False
+# ==========================================
+# 2. Setup TiDB Connection String
+# ==========================================
+print("Preparing TiDB Connection...")
+tidb_connection_string = (
+    f"mysql+pymysql://{os.getenv('TIDB_USER')}:{os.getenv('TIDB_PASSWORD')}"
+    f"@{os.getenv('TIDB_HOST')}:{os.getenv('TIDB_PORT')}/{os.getenv('TIDB_DATABASE')}"
+    "?ssl_verify_cert=false&ssl_verify_identity=false"
 )
 
-curr = db.cursor()
-
+# ==========================================
 # 3. Read and Clean the Dataset
+# ==========================================
 print("Reading dataset...")
-# Using '\t' to prevent splitting spaces within sentences. 
-# 'on_bad_lines="skip"' automatically drops corrupted rows.
+
+# Load the data, skipping any corrupted lines
 df = pd.read_csv("data_knowledge.csv", sep="\t", on_bad_lines="skip")
 
-# Clean column names from hidden whitespaces
+# Clean column headers by stripping trailing/leading whitespaces
 df.columns = df.columns.str.strip()
+
+# Drop rows where 'Question' or 'Answer' is missing
 df = df.dropna(subset=['Question', 'Answer'])
 
-# --- EMERGENCY DIAGNOSTICS ---
-print("\n--- COLUMN DETECTION RESULT ---")
-print(df.columns.tolist())
-print("---------------------------\n")
+# Remove duplicate questions to keep the dataset clean and unique
+df = df.drop_duplicates(subset=['Question'])
 
-# 4. Process and Embed Data
-try:
-    # Combine Question and Answer columns
-    df['qa_combined'] = df['Question'] + "\t" + df['Answer']
-    texts_to_embed = df['qa_combined'].tolist()
-    
-    print(f"Successfully loaded data! {len(texts_to_embed)} rows ready for processing.")
-    
-    # Batch Embedding Processing
-    print("Processing embeddings... This may take a while.")
-    embedding_list = embedder.encode(texts_to_embed).tolist()
-    
-    print("Embedding completed successfully!")
-    print(f"Total vectors generated: {len(embedding_list)}")
+# Combine the columns into a rich text format to provide better context for the AI
+df['qa_combined'] = (
+    "Topic: " + df['ArticleTitle'].astype(str) + "\n" +
+    "Question: " + df['Question'].astype(str) + "\n" +
+    "Fact/Answer: " + df['Answer'].astype(str)
+)
 
-    # 5. Database Insertion
-    sql_query = "INSERT INTO documents (text, embedding) VALUES (%s, %s)"
-    print("Saving data to TiDB Cloud...")
-    
-    # Iterate to insert data securely using parameterized queries
-    for text, embedding in zip(texts_to_embed, embedding_list):
-        # Convert vector list [0.1, 0.2, ...] into JSON string format
-        embedding_str = json.dumps(embedding)
-        curr.execute(sql_query, (text, embedding_str))
+# Convert the combined text into a Python list
+texts_to_embed = df['qa_combined'].tolist()
 
-    # Commit transactions to the database
-    db.commit()
-    print(f"Success! A total of {len(texts_to_embed)} records have been added to the database.")
+print(f"Successfully loaded data! {len(texts_to_embed)} rows ready for processing.")
 
-except KeyError as e:
-    print(f"[FAILED] Column {e} not found.")
-    print("Available columns in your current file are:", df.columns.tolist())
-except mysql.connector.Error as err:
-    print(f"[DATABASE ERROR] A MySQL/TiDB error occurred: {err}")
-finally:
-    # Safely close database connections
-    curr.close()
-    db.close()
+# ==========================================
+# 4. Ingest to TiDB Vector Store
+# ==========================================
+print("Connecting to TiDB and setting up the table...")
+
+# Step A: Open the connection and configure the vector store
+vector_store = TiDBVectorStore(
+    connection_string=tidb_connection_string,
+    table_name="documents",
+    distance_strategy="cosine",
+    embedding_function=embeddings
+)
+
+# Step B: Insert the new texts and their embeddings into the database
+print("Ingesting new data into TiDB Cloud... This process may take a few minutes.")
+vector_store.add_texts(texts=texts_to_embed)
+
+print(f"Success! All {len(texts_to_embed)} records have been seamlessly added to the database using the LangChain schema.")
